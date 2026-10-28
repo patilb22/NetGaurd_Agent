@@ -1,0 +1,2 @@
+row_index,threat_classification,confidence_score,reasoning,recommended_playbook,human_approved,action_taken
+41,BENIGN_OUTLIER,0.8,"The flow duration is extremely long (117211412 ms), which is a statistical outlier. However, the packet rate is low (0.9896647265 packets/sec), and there are no clear malicious markers in the telemetry. The flow is also labeled as 'Benign', which further supports the classification as a benign outlier.",PB-000_LOG_ONLY,True,LOG ONLY: assessment does not authorize a network change.
