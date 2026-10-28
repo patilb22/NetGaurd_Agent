@@ -1,0 +1,387 @@
+# Implementation Guide: Autonomous Network Sentinel (NetGuard-Agent)
+
+This guide provides step-by-step instructions and modular python implementations to upgrade **NetGuard-Agent** from a heuristic demo into a secure, LLM-powered autonomous defense framework with Human-In-The-Loop (HITL) execution controls.
+
+---
+
+## Architecture Overview
+
+```
++-----------------------------------------------------------------------------------+
+|                         1. Telemetry Ingestion & Preprocessing                    |
+|  - Load Hugging Face network flow dataset / PCAP streams                          |
+|  - Normalize attributes using StandardScaler                                      |
++--------------------------------------------------|--------------------------------+
+                                                   v
++-----------------------------------------------------------------------------------+
+|                         2. Unsupervised Anomaly Detection                         |
+|  - DBSCAN / Isolation Forest clustering                                           |
+|  - Isolate outlier noise points (-1 label)                                        |
++--------------------------------------------------|--------------------------------+
+                                                   v
++-----------------------------------------------------------------------------------+
+|                         3. LLM-Powered Agentic Triage (Part 1)                    |
+|  - LangChain + OpenAI structured output (Pydantic)                                |
+|  - Reasoning across packet metrics, ports, directions, and outlier distance       |
++--------------------------------------------------|--------------------------------+
+                                                   v
++-----------------------------------------------------------------------------------+
+|                         4. Human-In-The-Loop (HITL) Security Gate (Part 2)        |
+|  - LangGraph state interruption (`interrupt_before`)                              |
+|  - Operator reviews threat confidence & reasoning in Streamlit                    |
++--------------------------------------------------|--------------------------------+
+                                                   v
++-----------------------------------------------------------------------------------+
+|                         5. Safe Executable Playbooks (Part 2)                     |
+|  - Strict IP validation (`ipaddress` module)                                      |
+|  - Subprocess without shell execution (`shell=False`)                             |
+|  - Automated timed rollbacks (APScheduler)                                       |
++-----------------------------------------------------------------------------------+
+```
+
+---
+
+## Step 1: Telemetry Ingestion Layer
+
+Extract numerical features and normalize flow records.
+
+```python
+import pandas as pd
+from datasets import load_dataset
+from sklearn.preprocessing import StandardScaler
+
+def load_and_preprocess(max_rows: int = 5000):
+    """Loads network flow telemetry from Hugging Face and returns raw and normalized matrices."""
+    dataset = load_dataset("abmallick/network-traffic-anomaly", split="train", streaming=True)
+    rows = list(dataset.take(max_rows))
+    df = pd.DataFrame(rows)
+    
+    # Standardize column naming variations across schemas
+    column_mapping = {
+        'Flow Duration': 'flow_duration',
+        'Tot Fwd Pkts': 'packet_count',
+        'Flow Byts/s': 'byte_rate',
+        'Flow Pkts/s': 'packet_rate',
+        'Src IP': 'src_ip',
+        'Dst IP': 'dst_ip',
+        'Dst Port': 'dst_port'
+    }
+    df.rename(columns=column_mapping, inplace=True)
+    
+    # Feature matrix extraction
+    features = ['flow_duration', 'packet_count', 'byte_rate', 'packet_rate']
+    numeric_df = df[features].apply(pd.to_numeric, errors='coerce').fillna(0)
+    
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(numeric_df)
+    
+    return df, X_scaled
+```
+
+---
+
+## Step 2: Anomaly Detection Engine
+
+Identify unclustered outliers using DBSCAN.
+
+```python
+import numpy as np
+from sklearn.cluster import DBSCAN
+
+def isolate_anomalies(X_scaled, eps: float = 0.5, min_samples: int = 10):
+    """Applies DBSCAN clustering and returns indices of detected outlier noise points."""
+    model = DBSCAN(eps=eps, min_samples=min_samples)
+    labels = model.fit_predict(X_scaled)
+    
+    # Label -1 corresponds to DBSCAN noise (anomalies)
+    anomaly_indices = np.where(labels == -1)[0]
+    return labels, anomaly_indices
+```
+
+---
+
+## Step 3: Part 1 Implementation — LLM-Powered Agent Triage Engine
+
+Replace heuristic rules with a structured LLM classification pipeline using LangChain and Pydantic.
+
+### 3.1 Pydantic Threat Assessment Schema
+
+```python
+from pydantic import BaseModel, Field
+from typing import Literal
+
+class ThreatAssessment(BaseModel):
+    """Structured assessment output generated by the LLM security agent."""
+    threat_classification: Literal[
+        "PORT_SCAN", 
+        "HIGH_VOLUME_FLOOD", 
+        "SUSPICIOUS_OUTBOUND", 
+        "BENIGN_OUTLIER", 
+        "UNKNOWN_ANOMALY"
+    ] = Field(description="The primary security threat category inferred from telemetry.")
+    
+    confidence_score: float = Field(
+        description="Confidence score between 0.0 and 1.0 based on telemetry clarity.",
+        ge=0.0,
+        le=1.0
+    )
+    
+    reasoning: str = Field(
+        description="Step-by-step technical rationale explaining why this classification was assigned."
+    )
+    
+    recommended_playbook: Literal[
+        "PB-001_TEMPORARY_IP_BLOCK",
+        "PB-002_RATE_LIMIT",
+        "PB-003_CONTAINER_ISOLATION",
+        "PB-000_LOG_ONLY"
+    ] = Field(description="The specific mitigation playbook to execute if approved.")
+```
+
+### 3.2 LLM Triage Module
+
+```python
+from langchain_openai import ChatOpenAI
+from langchain_core.prompts import ChatPromptTemplate
+
+def create_llm_triage_chain():
+    """Builds a structured chain with strict schema enforcement."""
+    llm = ChatOpenAI(model="gpt-4o", temperature=0.0)
+    structured_llm = llm.with_structured_output(ThreatAssessment)
+    
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", """You are an expert SOC Analyst and Network Security Agent.
+Analyze the provided network flow telemetry anomaly and determine if it represents a threat.
+
+Context Guidelines:
+- High unique destination port counts (>20) with small packet sizes indicate PORT_SCAN.
+- Extreme packet rates (>1,000 pkts/sec) or abnormal byte bursts indicate HIGH_VOLUME_FLOOD.
+- Long outbound connections to external public IPs indicate SUSPICIOUS_OUTBOUND.
+- If statistical context indicates variance without malicious markers, classify as BENIGN_OUTLIER.
+
+Provide a structured assessment strictly adhering to the specified output schema."""),
+        ("user", """Network Flow Telemetry Context:
+Source IP: {src_ip}
+Destination IP: {dst_ip}
+Destination Port: {dst_port}
+Unique Destination Ports Triggered: {unique_dst_ports}
+Flow Duration: {flow_duration} ms
+Packet Count: {packet_count}
+Packet Rate: {packet_rate} pkts/sec
+Direction: {direction}
+Outlier Distance Metric: {outlier_score}
+""")
+    ])
+    
+    return prompt | structured_llm
+```
+
+---
+
+## Step 4: Part 2 Implementation — Secure Playbooks & HITL Agent Graph
+
+Implement parameter validation, non-shell execution, automated rollback capabilities, and human approval interrupts.
+
+### 4.1 Safe Playbook Engine with Timed Rollbacks
+
+```python
+import ipaddress
+import subprocess
+from datetime import datetime, timedelta
+from apscheduler.schedulers.background import BackgroundScheduler
+
+# Global scheduler for automated timed rollbacks
+rollback_scheduler = BackgroundScheduler()
+rollback_scheduler.start()
+
+class SafeSecurityPlaybooks:
+    
+    @staticmethod
+    def _unblock_ip_callback(ip_str: str):
+        """Callback task to revert iptables block rule upon timeout."""
+        try:
+            cmd = ["sudo", "iptables", "-D", "INPUT", "-s", ip_str, "-j", "DROP"]
+            subprocess.run(cmd, check=True, capture_output=True)
+            print(f"[ROLLBACK SUCCESS] Removed temporary block for IP: {ip_str}")
+        except Exception as e:
+            print(f"[ROLLBACK ERROR] Failed to remove block for IP {ip_str}: {str(e)}")
+
+    @classmethod
+    def execute_ip_block(cls, src_ip: str, duration_minutes: int = 30) -> str:
+        """Executes a safe temporary IP block using strict parameterization and a scheduled rollback."""
+        try:
+            # 1. Strict IP Validation to prevent command injection
+            ip_obj = ipaddress.ip_address(src_ip)
+            if ip_obj.is_loopback or ip_obj.is_private:
+                return f"EXECUTION REFUSED: Target IP {src_ip} is loopback/internal."
+            
+            clean_ip = str(ip_obj)
+            
+            # 2. Parameterized Execution (shell=False)
+            cmd = ["sudo", "iptables", "-A", "INPUT", "-s", clean_ip, "-j", "DROP"]
+            print(f"[EXECUTING] {' '.join(cmd)}")
+            # subprocess.run(cmd, check=True, capture_output=True) # Uncomment in target Linux deployment
+            
+            # 3. Schedule Automatic Rollback
+            run_time = datetime.now() + timedelta(minutes=duration_minutes)
+            rollback_scheduler.add_job(
+                cls._unblock_ip_callback,
+                'date',
+                run_date=run_time,
+                args=[clean_ip]
+            )
+            
+            return f"SUCCESS: Blocked {clean_ip} for {duration_minutes} mins. Scheduled rollback at {run_time.isoformat()}."
+        except ValueError:
+            return f"VALIDATION ERROR: Invalid IP address format: {src_ip}"
+        except Exception as e:
+            return f"EXECUTION FAILED: {str(e)}"
+
+    @classmethod
+    def execute_rate_limit(cls, src_ip: str) -> str:
+        """Applies local rate-limiting rules without raw shell invocation."""
+        try:
+            clean_ip = str(ipaddress.ip_address(src_ip))
+            cmd = [
+                "sudo", "iptables", "-A", "INPUT", "-p", "tcp", 
+                "-s", clean_ip, "-m", "limit", "--limit", "25/minute", "-j", "ACCEPT"
+            ]
+            print(f"[EXECUTING] {' '.join(cmd)}")
+            # subprocess.run(cmd, check=True, capture_output=True)
+            return f"SUCCESS: Rate-limiting applied to {clean_ip}."
+        except Exception as e:
+            return f"EXECUTION FAILED: {str(e)}"
+```
+
+### 4.2 LangGraph Orchestration with Human-in-the-Loop Interrupt
+
+```python
+from typing import TypedDict, Optional
+from langgraph.graph import StateGraph, END
+from langgraph.checkpoint.memory import MemorySaver
+
+class AgentState(TypedDict):
+    telemetry: dict
+    assessment: Optional[dict]
+    human_approved: Optional[bool]
+    execution_result: Optional[str]
+
+# Node 1: LLM Triage
+def llm_triage_node(state: AgentState) -> AgentState:
+    triage_chain = create_llm_triage_chain()
+    telemetry = state["telemetry"]
+    
+    result: ThreatAssessment = triage_chain.invoke(telemetry)
+    state["assessment"] = result.model_dump()
+    return state
+
+# Node 2: Human Approval Verification
+def approval_gate_node(state: AgentState) -> AgentState:
+    # State inspection point for human reviewer
+    return state
+
+# Node 3: Safe Execution Node
+def safe_execution_node(state: AgentState) -> AgentState:
+    if not state.get("human_approved", False):
+        state["execution_result"] = "CANCELLED: Action rejected by human operator."
+        return state
+        
+    assessment = state["assessment"]
+    playbook = assessment["recommended_playbook"]
+    ip = state["telemetry"].get("src_ip", "")
+    
+    if playbook == "PB-001_TEMPORARY_IP_BLOCK":
+        res = SafeSecurityPlaybooks.execute_ip_block(src_ip=ip)
+    elif playbook == "PB-002_RATE_LIMIT":
+        res = SafeSecurityPlaybooks.execute_rate_limit(src_ip=ip)
+    else:
+        res = f"LOG ONLY: Recorded assessment for IP {ip} without network modifications."
+        
+    state["execution_result"] = res
+    return state
+
+# Graph Assembly
+def build_agent_graph():
+    memory = MemorySaver()
+    workflow = StateGraph(AgentState)
+    
+    workflow.add_node("llm_triage", llm_triage_node)
+    workflow.add_node("approval_gate", approval_gate_node)
+    workflow.add_node("execute_playbook", safe_execution_node)
+    
+    workflow.set_entry_point("llm_triage")
+    workflow.add_edge("llm_triage", "approval_gate")
+    workflow.add_edge("approval_gate", "execute_playbook")
+    workflow.add_edge("execute_playbook", END)
+    
+    # Interrupt execution before reaching the approval gate to allow human review
+    app = workflow.compile(
+        checkpointer=memory,
+        interrupt_before=["approval_gate"]
+    )
+    return app
+```
+
+---
+
+## Step 5: Operations & Dashboard Integration (Streamlit)
+
+Interact with the HITL agent graph inside Streamlit to approve or reject proposed mitigations.
+
+```python
+import streamlit as st
+
+st.title("🛡️ NetGuard-Agent: Security Operations Dashboard")
+
+# Initialize agent graph session
+if "graph_app" not in st.session_state:
+    st.session_state.graph_app = build_agent_graph()
+
+# Simulated Telemetry Trigger
+sample_telemetry = {
+    "src_ip": "192.168.1.150",
+    "dst_ip": "10.0.0.1",
+    "dst_port": 80,
+    "unique_dst_ports": 45,
+    "flow_duration": 120,
+    "packet_count": 50,
+    "packet_rate": 15.2,
+    "direction": "inbound",
+    "outlier_score": 3.45
+}
+
+thread_config = {"configurable": {"thread_id": "session_001"}}
+
+if st.button("Run Telemetry Triage"):
+    # Step 1: Run graph until human interrupt
+    initial_state = {"telemetry": sample_telemetry, "assessment": None, "human_approved": None}
+    st.session_state.graph_app.invoke(initial_state, thread_config)
+
+# Fetch Current Graph State
+current_state = st.session_state.graph_app.get_state(thread_config)
+
+if current_state.next and "approval_gate" in current_state.next:
+    assessment = current_state.values.get("assessment", {})
+    
+    st.warning("⚠️ Action Required: Proposed Agent Mitigation Needs Approval")
+    
+    st.json({
+        "Threat Classification": assessment.get("threat_classification"),
+        "Confidence Score": assessment.get("confidence_score"),
+        "Reasoning": assessment.get("reasoning"),
+        "Recommended Playbook": assessment.get("recommended_playbook")
+    })
+    
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("Approve & Execute"):
+            st.session_state.graph_app.update_state(thread_config, {"human_approved": True})
+            final_state = st.session_state.graph_app.invoke(None, thread_config)
+            st.success(final_state.get("execution_result"))
+            
+    with col2:
+        if st.button("Reject Proposal"):
+            st.session_state.graph_app.update_state(thread_config, {"human_approved": False})
+            final_state = st.session_state.graph_app.invoke(None, thread_config)
+            st.error(final_state.get("execution_result"))
+```

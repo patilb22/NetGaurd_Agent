@@ -1,0 +1,4 @@
+powershell -ExecutionPolicy Bypass -File .\run_ingestion.ps1
+powershell -ExecutionPolicy Bypass -File .\run_dashboard.ps1
+.\run_dashboard.ps1 -SkipInstall
+powershell -ExecutionPolicy Bypass -File .\run_ingestion.ps1 -SkipInstall -MaxRows 2000 -MaxAgentRows 1
